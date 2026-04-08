@@ -1,0 +1,18 @@
+{
+  "OsCas12f1-plasmid": {
+    "cas12f": [
+      [
+        "ACGCTTAC",
+        "GGGAAAGA"
+      ]
+    ]
+  },
+  "OsCas12f1-genome": {
+    "cas12f": [
+      [
+        "CTAATACT",
+        "TGCCCGCC"
+      ]
+    ]
+  }
+}

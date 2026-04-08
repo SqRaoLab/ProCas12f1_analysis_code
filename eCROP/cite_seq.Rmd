@@ -1,0 +1,796 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-02-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load
+
+
+```{r load}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(glue)
+  library(SeuratWrappers)
+  library(ggplot2)
+  library(ggpubr)
+  library(stringr)
+  library(data.table)
+  library(dplyr)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+})
+```
+
+## Including Plots
+
+
+### Batch 1
+
+
+```{r pressure, echo=FALSE}
+adt = Read10X("batch1/outs/filtered_feature_bc_matrix/")
+
+# 创建 Seurat 对象
+obj <- CreateSeuratObject(
+  counts = adt$`Gene Expression`,  # RNA 矩阵
+  assay = "RNA"
+)
+
+# 添加 ADT 数据
+mtx = as.matrix(adt$`Antibody Capture`)
+obj[["ADT"]] <- CreateAssayObject(counts = mtx)
+
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+obj[["percent.rb"]] <- PercentageFeatureSet(obj, pattern = "^RP[SL]")
+trqwe::mcsaveRDS(obj, "eCROP/multi/batch1/seurat.rds")
+```
+
+
+## Batch 2 
+
+```{r pressure, echo=FALSE}
+adt = Read10X("batch2/outs/filtered_feature_bc_matrix/")
+
+
+# 创建 Seurat 对象
+obj <- CreateSeuratObject(
+  counts = adt$`Gene Expression`,  # RNA 矩阵
+  assay = "RNA"
+)
+
+# 添加 ADT 数据
+mtx = as.matrix(adt$`Antibody Capture`)
+obj[["ADT"]] <- CreateAssayObject(counts = mtx)
+
+
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+obj[["percent.rb"]] <- PercentageFeatureSet(obj, pattern = "^RP[SL]")
+trqwe::mcsaveRDS(obj, "eCROP/multi/batch2/seurat.rds")
+```
+
+
+## merge two batch
+
+```{R}
+obj1 = trqwe::mcreadRDS("eCROP/multi/batch1/seurat.rds")
+obj2 = trqwe::mcreadRDS("eCROP/multi/batch2/seurat.rds")
+
+obj = merge(obj1, obj2)
+obj = JoinLayers(obj)
+
+trqwe::mcsaveRDS(obj, "eCROP/multi/seurat.rds")
+```
+
+
+
+### QC
+
+
+```{r fig.height=4, fig.width=6}
+plot_dir = "eCROP/multi/batch2/plots"
+dir.create(plot_dir, showWarnings = F)
+
+VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0)
+VlnPlot(obj, features = c("nFeature_ADT", "nCount_ADT", "percent.rb"), ncol = 3, pt.size = 0)
+```
+
+
+```{R}
+obj <- subset(obj, subset = nFeature_RNA > 0 & nFeature_RNA < 7500 & nCount_RNA < 5e4 & percent.mt < 5 & percent.rb < 20)
+
+VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0)
+VlnPlot(obj, features = c("nFeature_ADT", "nCount_ADT", "percent.rb"), ncol = 3, pt.size = 0)
+```
+
+
+
+```{R fig.height=4, fig.width=12}
+library(harmony)
+
+DefaultAssay(obj) <- "RNA"
+obj <- FindVariableFeatures(obj)
+
+VariableFeaturePlot(obj)
+
+obj <- ScaleData(obj)
+obj <- RunPCA(obj)
+
+obj = RunHarmony(obj, "batch")
+
+ElbowPlot(obj, reduction = "harmony")
+
+
+obj <- RunUMAP(obj, dims=1:10, reduction.name = "umap", reduction = "harmony")
+obj <- FindNeighbors(obj, reduction = "harmony", dims = 1:10)
+ obj <- FindClusters(obj, resolution = 3, graph.name = "RNA_nn")
+
+# 可视化
+p = DimPlot(obj, reduction = "umap", group.by = "cells", label = T, cols = colors) + NoLegend()
+
+p1 = DimPlot(obj, cells.highlight = rownames(obj@meta.data)[obj@meta.data$batch == 1]) + NoLegend() + labs(title = "batch 1")
+p2 = DimPlot(obj, cells.highlight = rownames(obj@meta.data)[obj@meta.data$batch == 2]) + NoLegend() + labs(title = "batch 2")
+
+p + p1 + p2
+```
+
+
+
+## Cell type annotation
+
+
+```{r fig.height=6, fig.width=15}
+markers = list(
+  "LMPP"=c("SPNS3", "SMIM24", "HOPX", "SPINK2"),
+  "Gran"=c("AZU1", "ELANE", "CTSG", "MPO", "FUT4"),
+  "Mono"=c("LYZ", "VCAN", "FCN1", "CSF1R", "CD14", "FCGR3A"),
+  "EBMP"=c("GATA2", "HDC", "RNASE2", "PRG2", "CLC"),
+  "MEP"=c("GATA1", "TAL1", "KLF1", "GYPA"),
+  "EryP"=c("TFRC", "BCL11A"),
+  "Ery"=c("HBB", "AHSP", "APOC1", "CTNNBL1"),
+  "MK"=c("PF4", "GP9", "ITGA2B"),  # "PLEK", 
+  "mDC"=c("CD1C", "CLEC9A", "CD141"),
+  "pDC"=c("CLEC4C", "LILRA4"),
+  "ProPreB"=c("RAG1", "RAG2", "IGL11", "VPREB1"),
+  "NaiveB"=c("IGHM", "IGHD", "MS4A1", "CD19", "CD79A"),
+  "Mast"=c("CMA1", "TPSAB1", "MS4A2", "KIT")
+)
+
+lvls = c(
+  "LMPP", "EBMP", "MEP", "EryP", 
+  "BFU-E", "CFU-E", "ProEry", "Ery",
+  "MK", "Mast", "Neu", "Gran", "pDC", "mDC", 
+  "Mono", "Macro", "ProPreB", "NaiveB",
+  "MSC"  #, "unknown1"
+)
+lvls = c(lvls, as.character(sort(unique(obj@meta.data$seurat_clusters))))
+obj@meta.data$cells = factor(obj@meta.data$cells, levels = lvls)
+
+
+ordered_in_lvls <- markers[lvls[lvls %in% names(markers)]]
+not_in_lvls <- markers[!names(markers) %in% lvls]
+ordered_not_in_lvls <- not_in_lvls[sort(names(not_in_lvls))]
+markers <- c(ordered_in_lvls, ordered_not_in_lvls)
+
+p = DotPlot(
+  obj, assay = "RNA", group.by = "cells",
+  features = as.vector(unlist(markers)),
+) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, vjust = .5, hjust = 1))
+
+p
+```
+
+
+```{R fig.height=5, fig.width=10}
+
+cell_markers <- c(
+  "CD34", "CD38", "CD45RA",  
+  "CD235ab", "CD36", "CD105",  
+  "CD41", "CD61", "CD19", "CD10", "CD20", 
+  "CD14", "CD33", "CD11b",  
+  "CD11c", "CD141", "CD303", "CD304", "CD123", 
+  "CD15", "CD66b", "CD16",  "CD117"
+)
+
+obj@assays$ADT@counts = obj@assays$ADT@counts[, rownames(obj@meta.data)]
+
+obj@meta.data$cells = factor(obj@meta.data$cells, levels = intersect(levels(obj@meta.data$cells), unique(obj@meta.data$cells)))
+
+p = DotPlot(
+  obj, assay = "ADT", 
+  features = as.vector(unlist(cell_markers)), 
+  group.by = "cells", 
+  col.max=1.5, col.min=-1.5,
+  dot.min = 0, dot.scale = 6
+) +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5, hjust = 1))
+
+p
+```
+
+
+### sgRNA results
+
+```{R fig.height=5, fig.width=4}
+df = list(
+  as.data.frame(fread("eCROP/multi/batch1/sgrna_stats.csv.gz", col.names = c("name", "barcode", "umi", "gene", "sgrna", "seq"))),
+  as.data.frame(fread("eCROP/multi/batch2/sgrna_stats.csv.gz", col.names = c("name", "barcode", "umi", "gene", "sgrna", "seq")))
+)
+df[[1]]$barcode = paste0(df[[1]]$barcode, "_1")
+df[[2]]$barcode = paste0(df[[2]]$barcode, "_2")
+
+df = do.call(rbind, df)
+
+df = df %>%
+  filter(df$gene != "") %>%
+  group_by(barcode, gene) %>%
+  add_tally() %>%
+  dplyr::select(barcode, gene, n) %>%
+  unique() %>%
+  as.data.frame()
+
+df = reshape2::dcast(df, gene~barcode, value.var = "n", fun.aggregate = sum, fill = 0)
+rownames(df) = df$gene
+df = df[, colnames(df) != "gene"]
+
+
+mtx = as.data.frame(matrix(0, nrow = nrow(df), ncol = nrow(obj@meta.data)))
+rownames(mtx) = rownames(df)
+colnames(mtx) = rownames(obj@meta.data)
+
+mtx[rownames(df), intersect(colnames(df), colnames(mtx))] = df[, intersect(colnames(df), colnames(mtx))]
+
+
+obj[["STC"]] = CreateAssayObject(counts = mtx)
+DefaultAssay(obj) = "STC"
+obj = NormalizeData(obj)
+
+
+DefaultAssay(obj) = "STC"
+obj = ScaleData(obj)
+
+genes = rownames(obj@assays$STC_t@data)
+genes = genes[genes != "STC"]
+
+
+plist = lapply(c("STC", genes), function(i) {
+  umap = as.data.frame(obj@reductions$umap@cell.embeddings)
+  umap$value = obj@assays$STC_t@data[i, rownames(umap)]
+
+  color_pal = c("lightgrey", "yellow", "red")
+  if (i == "STC") {
+    color_pal = c("white", "#D5E5F2FF", "#A9D2DC", "#4575b4") # c("lightgrey", "blue")
+  }
+  umap = umap[order(umap$value, decreasing = T), ]
+  p = ggplot(umap, aes(x = umap_1, y = umap_2, z=value)) +  # 去掉 color=value
+    stat_summary_hex(bins = c(30, 30), fun = "mean", na.rm = T) +  # 修正 bins 语法
+    # gradient_fill("YlOrRd") +
+    labs(title = i) +
+    theme_pubr()
+  
+  
+  if (i == "STC") {
+    p = p + scale_fill_gradientn(
+      name = "Cell count",
+      colors = color_pal,
+      limits = c(0, 1.5),  # 根据你的数据范围调整
+      values = scales::rescale(c(0, .2, 1.5)),
+      oob = scales::squish,
+      na.value = "lightgrey"
+    )
+  } else {
+    p = p + scale_fill_gradientn(
+      name = "Cell count",
+      colors = color_pal,
+      values = scales::rescale(c(0, .2, 1)),
+      limits = c(0, 1),  # 根据你的数据范围调整
+      oob = scales::squish,
+      na.value = "lightgrey"
+    )
+  }
+  
+  p
+})
+
+cowplot::plot_grid(plotlist = plist, nrow = 7)
+```
+
+
+
+
+```{R fig.height=12, fig.width=16, eval=FALSE}
+df = list(
+  as.data.frame(fread("eCROP/multi/batch1/sgrna_stats_sgrna.csv.gz")),
+  as.data.frame(fread("eCROP/multi/batch2/sgrna_stats_sgrna.csv.gz"))
+)
+
+df[[1]]$barcode = paste0(df[[1]]$barcode, "-1_1")
+df[[2]]$barcode = paste0(df[[2]]$barcode, "-1_2")
+
+df = do.call(rbind, df)
+df = df[df$barcode %in% rownames(obj@meta.data), ]
+
+# 修改后的selectGuide函数
+selectGuide <- function(data, barcode) {
+  # data是分组后的数据框
+  # barcode是当前分组的barcode值
+  
+  # 确保data是数据框
+  data <- as.data.frame(data)
+  
+  # 如果数据为空，返回NULL
+  if(nrow(data) == 0) return(NULL)
+  
+  # 获取非零值
+  vals <- sort(data$value, decreasing = TRUE)
+  
+  # 情况1：所有值都为0
+  if(all(vals == 0)) {
+    return(data.frame(
+      gene = data$gene,
+      value = data$value,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # 情况2：有多个最大值，且都是同一个基因
+  max_val <- vals[1]
+  max_rows <- data[data$value >= max_val, ]
+  
+  if(nrow(max_rows) > 1) {
+    if(length(unique(max_rows$gene)) == 1) {
+      return(data.frame(
+        gene = max_rows$gene[1],
+        value = max_val,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  
+  # 情况3：最大值远大于其他值的和
+  if(length(vals) > 1 && max_val >= sum(vals[2:length(vals)]) * 3) {
+    return(data.frame(
+      gene = max_rows$gene[1],
+      value = max_val,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # 默认返回NULL
+  return(NULL)
+}
+
+
+# 使用group_modify而不是group_map
+df_result <- df %>%
+  group_by(barcode) %>%
+  group_modify(~ {
+    result <- selectGuide(.x, .y$barcode)
+    if(is.null(result)) {
+      # 返回空数据框，但保持结构一致
+      return(data.frame(
+        gene = character(0),
+        value = numeric(0),
+        stringsAsFactors = FALSE
+      ))
+    }
+    return(result)
+  }) %>%
+  ungroup()
+# 转换为普通数据框
+df_result <- as.data.frame(df_result)
+
+
+df_result = reshape2::dcast(df_result[df_result$gene != "", ], gene~barcode, value.var = "value", fun.aggregate = mean, fill = 0)
+rownames(df_result) = df_result$gene
+df_result = df_result[, colnames(df_result) != "gene"]
+df_result = df_result[, intersect(colnames(df_result), rownames(obj@meta.data))]
+```
+
+
+
+```{r}
+df = na.omit(df)
+
+# 统计基本值
+calculate_sgrna_stats = function(df_result, cols = "cells") {
+  temp = reshape2::melt(as.matrix(df_result))
+  temp = temp[temp$value > 0, ]
+  temp$cells = as.character(obj@meta.data[as.character(temp$Var2), cols])
+  
+  temp1 = as.data.frame(table(unique(temp[temp$Var1 != "STC", c("cells", "Var2")])$cells))
+  
+  temp = temp %>%
+    group_by(Var1, cells) %>%
+    add_tally() %>%
+    dplyr::select(Var1, cells, n) %>%
+    unique() %>%
+    reshape2::dcast(cells~Var1, value.var = "n", fun.aggregate = sum, fill = 0) %>%
+    as.data.frame()
+  
+  temp = merge(temp, temp1, by.x = "cells", by.y = "Var1")
+  rownames(temp) = temp$cells
+  temp[, colnames(temp) != "cells"]
+}
+
+# 检查是否显著
+check = function(temp, cells, genes) {
+  a = temp[cells, genes]
+  b = sum(temp[, genes])
+
+  c = temp[cells, "STC"]
+  d = sum(temp[, "STC"])
+  
+  # 1. 构建列联表 (Contingency Table)
+  # 沿用你上一轮问题中的例子：
+  # 行是“细胞类型”（目标簇 vs. 其他），列是“gRNA类型”（目标基因 vs. STC）
+  # 假设数据如下：
+  #                目标簇   其他簇
+  # 目标基因gRNA       a        b
+  # STC对照gRNA        c        d
+
+  contingency <- matrix(c(a, b - a,
+                          c, d - c),
+                        nrow = 2, byrow = TRUE)
+  p = fisher.test(contingency)
+  print(glue::glue("{c}: {p$p.value} {p$estimate}; a={a}; b={b}; c={c}; d={d}"))
+}
+
+
+temp = calculate_sgrna_stats(df_result, cols = "cells")
+```
+
+
+```{r fig.height=5, fig.width=10}
+res = lapply(rownames(temp), function(cell) {
+  res = lapply(colnames(temp)[!colnames(temp) %in% c("STC", "Freq", "Total")], function(gene) {
+    a = temp[cell, gene]
+    b = sum(temp[, gene])
+    
+    c = temp[cell, "STC"]
+    d = sum(temp[, "STC"])
+    
+    contingency <- matrix(c(a, b - a,
+                            c, d - c), 
+                          nrow = 2, byrow = TRUE)
+    p = fisher.test(contingency)
+    data.frame(gene=gene, cell=cell, p_val = p$p.value, odd_ratio = p$estimate, pos_in_targets=a, pos_total=b, ctrl_in_targets=c, ctrl_total=d)
+  })
+  do.call(rbind, res)
+})
+res = do.call(rbind, res)
+rownames(res) = NULL
+res$log2od = log2(res$odd_ratio)
+
+res = res %>%
+  group_by(cell) %>%
+  mutate(padj=p.adjust(p_val, method = "none")) %>%
+  as.data.frame()
+
+
+res = res %>%
+  filter(pos_in_targets > 0) %>% # padj < 0.05 & 
+  group_by(cell) %>%
+  mutate(N = sum(pos_in_targets)) %>%
+  mutate(sig.perc = pos_in_targets / N) %>%
+  as.data.frame()
+
+
+tfs = list(
+  Novel=c(
+    "ZNF875", "ZNF706", "ZNF555", "ZNF512", "ZNF431", "ZNF385D", "ZNF207",
+    "ZBTB8A", "ZBTB16", "THYN1", "TFDP2", "TCF7L2", "STAT5", "SMYD3", 
+    "SCMH1", "SALL4", "POU2AF1", "PA2G4", "NR3C1", "NME2", "MLXIP",
+    "MEF2A", "MAFF", "IRF5", "HOXA6", "HMGN3", "HMGA1", "GTF3A",
+    "ELK3", "ELK1", "E2F2", "DRAP1", "CSRNP1", "CHCHD3", "AHDC1" 
+  ),
+  Known=c(
+     "RIOK2", "RUNX3", "KLF1", "GATA1", "GATA2", "TAL1", "LEF1", "CEBPE", "SPI1", "HOXA7"
+  )
+)
+
+
+res = res[res$gene %in% unlist(tfs), ]
+res$gene = factor(res$gene, levels = rev(unique(as.character(unlist(tfs)))))
+res$group = ifelse(
+  res$gene %in% tfs$Novel,
+  "Novel", "Known"
+)
+res$cell = factor(res$cell, levels = rev(sort(unique(obj@meta.data$cells))))
+
+
+p = ggscatter(
+  res[!res$cell %in% c("pDC", "ProPreB", "NaiveB", "mDC", "Mast"), ], x="gene", y="cell",
+  color="log2od", size="sig.perc"
+) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5)) +
+  scale_color_gradientn(
+    name="log2(OR)",
+    colours=c("#3300cc","#4157A4","white","#FF3333","#CC0000"),
+    limits = c(-2, 2),
+    oob = scales::squish
+  ) +
+  scale_size_continuous(limits = c(0, 1), range = c(1, 6)) +
+  facet_grid(.~group, scales = "free_x", space="free") +
+  labs(x = "", y="")
+
+p
+```
+
+
+S17
+
+```{R fig.height=5, fig.width=10}
+temp = reshape2::melt(as.matrix(df_result))
+temp$cell = obj@meta.data[temp$Var2, "cells"]
+temp = temp[temp$value != 0 & temp$Var1 != "STC", ]
+
+temp = temp %>%
+  group_by(Var1) %>%
+  add_tally() %>%
+  dplyr::select(Var1, n) %>%
+  unique() %>%
+  as.data.frame()
+
+
+p = ggbarplot(
+  temp, x="Var1", y="n", fill="#598BB8", color = NA
+) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5),
+    panel.border = element_rect(color = "black",  # 边框颜色
+                                fill = NA,        # 不填充
+                                linewidth = 1)    # 边框粗细
+  ) +
+  labs(y = "Number of cells", x="") +
+  geom_hline(yintercept = 100, linetype = "dashed")
+
+p
+```
+
+
+```{R}
+temp = reshape2::melt(as.matrix(df_result))
+temp$cell = obj@meta.data[temp$Var2, "cells"]
+temp = temp[temp$value != 0, ]
+
+temp = data.frame(
+  group = c("STC", "TF-targeting sgRNAs", "Not detected"),
+  value = c(
+    sum(temp$Var1 == "STC"), 
+    sum(temp$Var1 != "STC"),
+    ncol(obj) - nrow(temp)
+  )
+)
+temp$freq = glue::glue("{round(temp$value / sum(temp$value) * 100, digits = 2)}%")
+
+p = ggpie(
+  temp, "value", label = "freq", fill = "group",
+  color = "white",
+  palette = c("lightgrey", "#f08e7e", "#2572a9"),
+  lab.pos = "in", lab.font = "black"
+) + labs(fill = "")
+
+p
+```
+
+
+
+
+```{r fig.height=4, fig.width=10}
+df_result = reshape2::dcast(df_result[df_result$sgrna != "", ], sgrna~barcode, value.var = "value", fun.aggregate = mean, fill = 0)
+rownames(df_result) = df_result$sgrna
+df_result = df_result[, colnames(df_result) != "sgrna"]
+
+temp = reshape2::melt(as.matrix(df_result))
+temp$cell = obj@meta.data[temp$Var2, "cells"]
+temp = temp[temp$value != 0, ]
+temp = temp[temp$value != 0 & str_detect(temp$Var1, "STC"), ]
+
+temp = temp %>%
+  group_by(cell, Var1) %>%
+  add_tally() %>%
+  dplyr::select(cell, Var1, n) %>%
+  unique() %>%
+  group_by(Var1) %>%
+  mutate(p = n / sum(n) * 100) %>%
+  as.data.frame()
+
+temp$Var1 = factor(temp$Var1, levels = paste0("STC_", 1:15))
+
+
+temp = lapply(unique(temp$cell), function(x) {
+  stcs = unique(temp$Var1)
+  temp = temp[temp$cell == x, ]
+  
+  stcs = stcs[!stcs %in% temp$Var1]
+  
+  if (length(stcs) > 0 ) {
+    temp = rbind(temp, data.frame(cell=x, Var1=stcs, n=0, p=0))
+  }
+  temp
+})
+
+temp = do.call(rbind, temp)
+
+p = ggbarplot(
+  temp, x="cell", y="p", fill="Var1", color=NA,
+  position = position_dodge2(),
+  ggtheme = theme_pubr(legend = "right")
+) + labs(
+  fill = "",
+  x="", y="Cell proportion (%)"
+) +
+  paletteer::scale_fill_paletteer_d("RColorBrewer::Paired")
+
+
+p
+```
+
+
+
+```{R}
+library(corrplot)
+
+mtcars = reshape2::dcast(temp, Var1~cell, value.var = "p", fill = 0, fun.aggregate = mean)
+rownames(mtcars) = mtcars$Var1
+mtcars = mtcars[, colnames(mtcars) != "Var1"]
+```
+
+
+
+```{R fig.height=8, fig.width=8}
+library(corrgram)
+library(RColorBrewer)
+
+
+# 使用计数器追踪面板位置
+n_vars <- nrow(mtcars)
+
+panel_counter <- 0
+
+panel.pts.simple.ticks <- function(x, y, ...) {
+    # 绘制散点
+    panel.pts(x, y, ...)
+    
+    # 更新计数器
+    panel_counter <<- panel_counter + 1
+    
+    # 获取当前面板的用户坐标范围
+    usr <- par("usr")
+    
+    # 计算当前面板的行列（假设下三角按列填充）
+    # 按行填充计算行和列
+    # 对于下三角，每行有 (行号-1) 个面板
+    # 找到当前计数器对应的行
+    row_idx <- 1
+    total_in_previous_rows <- 0
+    
+    while(panel_counter > total_in_previous_rows + (row_idx - 1)) {
+        total_in_previous_rows <- total_in_previous_rows + (row_idx - 1)
+        row_idx <- row_idx + 1
+    }
+    
+    # 列索引 = 当前行内的第几个面板 + 1
+    col_idx <- panel_counter - total_in_previous_rows
+    # cat(glue::glue("{panel_counter}: {row_idx} {col_idx}\n\n"))
+    
+    # 获取实际数据的范围
+    x_range <- range(x, na.rm = TRUE)
+    y_range <- range(y, na.rm = TRUE)
+    
+    # 只在最左侧添加y轴刻度（第一列）
+    if(col_idx == 1) {
+        axis(2, at = pretty(range(y), n = 3), cex.axis = 0.7, 
+             col = "gray50", col.axis = "black", las = 1)
+    }
+    
+    # 只在最底部添加x轴刻度（最后一行）
+    if(row_idx == n_vars) {
+        axis(1, at = pretty(range(x), n = 3), cex.axis = 0.7,
+             col = "gray50", col.axis = "black")
+    }
+}
+
+
+# 自定义shade面板 - 带相关性数值
+panel.shade.with.cor <- function(x, y, cor.method = "pearson", ...) {
+    # 计算相关系数
+    cor_val <- cor(x, y, method = cor.method, use = "complete.obs")
+    # print(cor_val)  # 打印查看实际值
+    
+    # 获取当前面板的用户坐标
+    usr <- par("usr")
+    
+    # 将cor_val映射到颜色索引
+    # 你的数据范围是0.95-1.0，我们专门针对这个范围做映射
+    if(cor_val >= 0.95) {
+        # 0.95-1.0 映射到 1-200
+        color_idx <- round((cor_val - 0.95) / 0.05 * 199) + 1
+        color_idx <- max(1, min(200, color_idx))
+    } else {
+        # 低于0.95的用最浅色
+        color_idx <- 1
+    }
+    
+    fill_color <- my_colors[color_idx]
+    
+    # 绘制填充矩形
+    rect(usr[1], usr[3], usr[2], usr[4], 
+         col = fill_color, border = "gray80", lwd = 0.5)
+    
+    # 添加相关性数值
+    text(mean(usr[1:2]), mean(usr[3:4]), 
+         sprintf("%.3f", cor_val),  # 显示3位小数，因为你的数据很接近
+         cex = 1.2, 
+         col = ifelse(cor_val > 0.98, "white", "black"),  # 0.98以上用白字
+         font = 2)
+}
+
+var_names <- rownames(mtcars)  # 获取变量名作为标签
+
+
+# 自定义调色板 - 针对0.95-1.0的高相关性
+custom_palette_high_cor <- function(n = 200) {
+    # 定义关键点的颜色 (针对你的数据范围0.95-1.0)
+    # 让颜色在0.95-1.0之间有丰富的变化
+    key_points <- c(0.95, 0.96, 0.97, 0.98, 0.99, 1.0)
+    key_colors <- c(
+      "#ffffcc",  # 0.95: 浅黄
+      "#ffeda0",  # 0.96: 黄
+      "#fed976",  # 0.97: 橙黄
+      "#feb24c",  # 0.98: 橙
+      "#fd8d3c",  # 0.99: 橙红
+      "#f03b20"   # 1.00: 红
+    )
+    
+    # 创建插值函数
+    color_func <- colorRamp(key_colors, space = "rgb")
+    
+    # 生成从0.95到1.0的等间隔序列
+    t <- seq(0, 1, length.out = n)
+    rgb_colors <- color_func(t) / 255
+    rgb(rgb_colors[,1], rgb_colors[,2], rgb_colors[,3])
+}
+
+
+# 创建调色板生成器
+my_colors <- custom_palette_high_cor(200)
+
+
+corrgram(
+  t(mtcars),
+  main="",
+  lower.panel = panel.pts.simple.ticks,
+  upper.panel = panel.shade.with.cor,  # 使用自定义面板,
+  diag.panel = panel.density,
+  order = F, labels = NULL,
+  outer.labels = list(
+     top = list(            # 底部外侧标签
+         labels = var_names,
+         cex = 1.2,             # 字体大小
+         srt = 0,               # 旋转45度
+         adj = c(.5, -.5)                  # 对齐方式
+     ),
+     right = list(               # 左侧外侧标签
+         labels = var_names,
+         cex = 1.2,
+         srt = 0,                # 不旋转
+         adj = c(0, 0)            # 对齐方式
+     )
+ )
+)
+```
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
