@@ -105,7 +105,7 @@ VlnPlot(obj, features = c("nFeature_ADT", "nCount_ADT", "percent.rb"), ncol = 3,
 
 
 ```{R}
-obj <- subset(obj, subset = nFeature_RNA > 0 & nFeature_RNA < 7500 & nCount_RNA < 5e4 & percent.mt < 5 & percent.rb < 20)
+obj <- subset(obj, subset = nFeature_RNA > 500 & nCound_RNA > 100 & nFeature_RNA < 7500 & nCount_RNA < 5e4 & percent.mt < 5 & percent.rb < 20)
 
 VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0)
 VlnPlot(obj, features = c("nFeature_ADT", "nCount_ADT", "percent.rb"), ncol = 3, pt.size = 0)
