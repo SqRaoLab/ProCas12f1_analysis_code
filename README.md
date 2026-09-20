@@ -99,8 +99,8 @@ Global options:
 ./editing_analysis/decodeFq/decodeFq -1 example/OsCas12f1-genome_R1.fq.gz -2 example/OsCas12f1-genome_R2.fq.gz -c OsCas12f1 -l example/library.json -o example/genome.tsv.gz
 ./editing_analysis/decodeFq/decodeFq -1 example/OsCas12f1-plasmid_R1.fq.gz -2 example/OsCas12f1-plasmid_R2.fq.gz -c OsCas12f1 -l example/library.json -o example/plasmid.tsv.gz
 
-# calculate editing frequency
-./editing_analysis/calFreq/calFreq -i example/genome.tsv.gz -b example/plasmid.tsv.gz -o example/indel_freq.tsv.gz
+# calculate editing frequency (set the root path inside the script first)
+Rscript editing_analysis/calculate_freq.R
 ```
 
 ---
@@ -111,28 +111,26 @@ The eCROP folder contains the code for analyzing eCROP-seq data from the manuscr
 
 ### 2.1 Installation
 
-In addition to the Python environment, R 4.5+ and the following R libraries are required:
+In addition to a Python environment (for sgRNA counting), R 4.5+ and the following R packages are required:
 
 Package|Package|Package
 ---|---|---
-corrplot|data.table|dplyr
-forcasts|ggplot2|ggsci
-GGally|gridExtra|Matrix
-pheatmap|purrr|qs
-readr|scales|Seurat
-SingleR|tibble|tidyr
-tidyverse|harmony| 
+corrgram|cowplot|data.table
+dplyr|ggpubr|ggplot2
+glue|glmnet|harmony
+Matrix|reshape2|scales
+Seurat|SeuratWrappers|stringr
+tibble|tidyr|trqwe
+
+The `count_sgrna_10x.py` script additionally requires the Python packages `pandas`, `pysam`, `click` and `rich`.
 
 ### 2.2 Usage Examples
 
 Script|Description
 ---|---
-crop_count.py|Count sgRNAs from eCROP-seq experiments. Use python crop_count.py -h for help.
-sgrna_assign.R|Integrate gRNA assignments from read and transcriptome data, filter low-quality cells based on QC metrics, and append final assignments to the gene-count matrix.
-eCROP_UMAPs.R|Load aggregated scRNA-seq data into R using Seurat, integrate sgRNA assignments into the object metadata, and perform data processing to generate Figure 6 of the manuscript.
-eCROP_Seurat.R|Additional Seurat-based analysis for eCROP data.
-eCROP_ClusterEnrichments.R|Cluster enrichment analysis for eCROP data.
-cite_seq.Rmd|Rmarkdown file for CITE-seq data analysis.
+count_sgrna_10x.py|Extract and quantify sgRNAs from 10x single-cell FASTQ/BAM files. Run `python count_sgrna_10x.py --help` for details.
+cite_seq.Rmd|End-to-end eCROP-seq / CITE-seq analysis: Seurat object construction, QC, Harmony integration and clustering, cell-type annotation, per-cell sgRNA assignment, Fisher enrichment testing, STC guide correlation, sgRNA composition and UMAP density plots.
+run_ridge.R|Ridge-regression model of gene expression on sgRNA assignments (standalone). Adjust the paths at the top of the script before running.
 
 ## License
 
