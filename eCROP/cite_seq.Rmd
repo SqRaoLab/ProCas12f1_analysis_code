@@ -1,0 +1,480 @@
+---
+title: "eCROP CROP-seq analysis"
+output: html_document
+date: "2026-02-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 0. Setup and paths
+
+```{r paths}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(glue)
+  library(SeuratWrappers)
+  library(ggplot2)
+  library(ggpubr)
+  library(stringr)
+  library(data.table)
+  library(dplyr)
+  library(reshape2)
+  library(tidyr)
+  library(corrgram)
+  library(scales)
+  library(cowplot)
+})
+
+# ---------------------------------------------------------------------------
+# EDIT THESE PATHS FOR YOUR ENVIRONMENT
+#   BASE    : directory holding intermediate objects (multi/batch1, multi/batch2)
+#   RES_DIR : directory for output figures and tables
+#   RAW_DIR : directory holding the per-batch Cell Ranger output folders
+# ---------------------------------------------------------------------------
+BASE    <- "path/to/eCROP/data"
+RES_DIR <- "path/to/eCROP/results"
+RAW_DIR <- "path/to/cellranger"
+dir.create(RES_DIR, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 1. Build Seurat objects (Batch 1 / Batch 2)
+
+Sections 1-5 document how the raw Cell Ranger output was processed into the annotated
+object (they require the raw data and the curated `cells` annotation, and are therefore
+shown but not re-executed). The executable downstream analysis starts in section 6 from
+the analysis-ready object.
+
+```{r build-batch1, eval=FALSE}
+adt <- Read10X(file.path(RAW_DIR, "batch1/outs/filtered_feature_bc_matrix"))
+
+# Create Seurat object from the gene-expression matrix
+obj <- CreateSeuratObject(
+  counts = adt$`Gene Expression`,
+  assay = "RNA"
+)
+
+# Add the antibody-capture (ADT) assay
+mtx <- as.matrix(adt$`Antibody Capture`)
+obj[["ADT"]] <- CreateAssayObject(counts = mtx)
+
+# The [[ operator adds columns to the object metadata; useful for QC stats
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+obj[["percent.rb"]] <- PercentageFeatureSet(obj, pattern = "^RP[SL]")
+trqwe::mcsaveRDS(obj, file.path(BASE, "multi/batch1/seurat.rds"))
+```
+
+```{r build-batch2, eval=FALSE}
+adt <- Read10X(file.path(RAW_DIR, "batch2/outs/filtered_feature_bc_matrix"))
+
+# Create Seurat object from the gene-expression matrix
+obj <- CreateSeuratObject(
+  counts = adt$`Gene Expression`,
+  assay = "RNA"
+)
+
+# Add the antibody-capture (ADT) assay
+mtx <- as.matrix(adt$`Antibody Capture`)
+obj[["ADT"]] <- CreateAssayObject(counts = mtx)
+
+# The [[ operator adds columns to the object metadata; useful for QC stats
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+obj[["percent.rb"]] <- PercentageFeatureSet(obj, pattern = "^RP[SL]")
+trqwe::mcsaveRDS(obj, file.path(BASE, "multi/batch2/seurat.rds"))
+```
+
+## 2. Merge the two batches
+
+```{r merge, eval=FALSE}
+obj1 <- trqwe::mcreadRDS(file.path(BASE, "multi/batch1/seurat.rds"))
+obj2 <- trqwe::mcreadRDS(file.path(BASE, "multi/batch2/seurat.rds"))
+
+obj <- merge(obj1, obj2)
+obj <- JoinLayers(obj)
+
+trqwe::mcsaveRDS(obj, file.path(BASE, "multi/seurat.rds"))
+```
+
+## 3. Quality control
+
+```{r qc-plots, eval=FALSE, fig.height=4, fig.width=6}
+VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0)
+VlnPlot(obj, features = c("nFeature_ADT", "nCount_ADT", "percent.rb"), ncol = 3, pt.size = 0)
+```
+
+```{r qc-filter, eval=FALSE}
+obj <- subset(obj, subset = nFeature_RNA > 500 & nCount_RNA > 100 &
+                nFeature_RNA < 7500 & nCount_RNA < 5e4 & percent.mt < 5 & percent.rb < 20)
+
+VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0)
+VlnPlot(obj, features = c("nFeature_ADT", "nCount_ADT", "percent.rb"), ncol = 3, pt.size = 0)
+```
+
+## 4. Dimensionality reduction, batch correction and clustering
+
+```{r clustering, eval=FALSE, fig.height=4, fig.width=12}
+library(harmony)
+
+DefaultAssay(obj) <- "RNA"
+obj <- FindVariableFeatures(obj)
+
+VariableFeaturePlot(obj)
+
+obj <- ScaleData(obj)
+obj <- RunPCA(obj)
+
+obj <- RunHarmony(obj, "batch")
+
+ElbowPlot(obj, reduction = "harmony")
+
+obj <- RunUMAP(obj, dims = 1:10, reduction.name = "umap", reduction = "harmony")
+obj <- FindNeighbors(obj, reduction = "harmony", dims = 1:10)
+obj <- FindClusters(obj, resolution = 3, graph.name = "RNA_nn")
+
+# Visualise clusters and the contribution of each batch
+p  <- DimPlot(obj, reduction = "umap", group.by = "seurat_clusters", label = TRUE) + NoLegend()
+p1 <- DimPlot(obj, cells.highlight = rownames(obj@meta.data)[obj@meta.data$batch == 1]) +
+  NoLegend() + labs(title = "batch 1")
+p2 <- DimPlot(obj, cells.highlight = rownames(obj@meta.data)[obj@meta.data$batch == 2]) +
+  NoLegend() + labs(title = "batch 2")
+
+p + p1 + p2
+```
+
+## 5. Cell type annotation
+
+```{r annotation-rna, eval=FALSE, fig.height=6, fig.width=15}
+markers <- list(
+  "LMPP"    = c("SPNS3", "SMIM24", "HOPX", "SPINK2"),
+  "Gran"    = c("AZU1", "ELANE", "CTSG", "MPO", "FUT4"),
+  "Mono"    = c("LYZ", "VCAN", "FCN1", "CSF1R", "CD14", "FCGR3A"),
+  "EBMP"    = c("GATA2", "HDC", "RNASE2", "PRG2", "CLC"),
+  "MEP"     = c("GATA1", "TAL1", "KLF1", "GYPA"),
+  "EryP"    = c("TFRC", "BCL11A"),
+  "Ery"     = c("HBB", "AHSP", "APOC1", "CTNNBL1"),
+  "mDC"     = c("CD1C", "CLEC9A", "CD141"),
+  "pDC"     = c("CLEC4C", "LILRA4"),
+  "ProPreB" = c("RAG1", "RAG2", "IGL11", "VPREB1"),
+  "NaiveB"  = c("IGHM", "IGHD", "MS4A1", "CD19", "CD79A"),
+  "Mast"    = c("CMA1", "TPSAB1", "MS4A2", "KIT")
+)
+
+# Curated cell-type order used for plotting
+lvls <- c(
+  "LMPP", "EBMP", "MEP", "EryP",
+  "ProEry", "Ery",
+  "Mast", "Neu", "Gran", "pDC", "mDC",
+  "Mono", "ProPreB", "NaiveB",
+  "MSC"
+)
+
+# `cells` is the curated cell-type annotation carried in the analysis-ready object
+lvls <- c(lvls, as.character(sort(unique(obj@meta.data$seurat_clusters))))
+obj@meta.data$cells <- factor(obj@meta.data$cells, levels = lvls)
+
+# Keep the marker order consistent with the cell-type order
+ordered_in_lvls <- markers[lvls[lvls %in% names(markers)]]
+not_in_lvls <- markers[!names(markers) %in% lvls]
+ordered_not_in_lvls <- not_in_lvls[sort(names(not_in_lvls))]
+markers <- c(ordered_in_lvls, ordered_not_in_lvls)
+
+p <- DotPlot(
+  obj, assay = "RNA", group.by = "cells",
+  features = as.vector(unlist(markers))
+) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, vjust = .5, hjust = 1))
+
+p
+```
+
+```{r annotation-adt, eval=FALSE, fig.height=5, fig.width=10}
+cell_markers <- c(
+  "CD34", "CD38", "CD45RA",
+  "CD235ab", "CD36", "CD105",
+  "CD41", "CD61", "CD19", "CD10", "CD20",
+  "CD14", "CD33", "CD11b",
+  "CD11c", "CD141", "CD303", "CD304", "CD123",
+  "CD15", "CD66b", "CD16", "CD117"
+)
+
+obj@assays$ADT@counts <- obj@assays$ADT@counts[, rownames(obj@meta.data)]
+
+obj@meta.data$cells <- factor(obj@meta.data$cells,
+                              levels = intersect(levels(obj@meta.data$cells),
+                                                 unique(obj@meta.data$cells)))
+
+p <- DotPlot(
+  obj, assay = "ADT",
+  features = as.vector(unlist(cell_markers)),
+  group.by = "cells",
+  col.max = 1.5, col.min = -1.5,
+  dot.min = 0, dot.scale = 6
+) +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5, hjust = 1))
+
+p
+```
+
+## 6. Analysis-ready object
+
+```{r analysis-object}
+obj <- readRDS(file.path(BASE, "multi/seurat_clean.rds"))
+```
+
+## 7. sgRNA assignment (gene level / sgRNA level)
+
+Guides are assigned per cell using a dominance rule: the most abundant guide is kept
+only if it is unambiguous, i.e. either all tied top guides target the same gene/sgRNA,
+or its count is at least three times the sum of all other guides.
+
+```{r assign}
+selectGuide <- function(data, barcode) {           # gene-level assignment
+  data <- as.data.frame(data); if (nrow(data) == 0) return(NULL)
+  vals <- sort(data$value, decreasing = TRUE)
+  if (all(vals == 0)) return(NULL)
+  max_val <- vals[1]; max_rows <- data[data$value >= max_val, ]
+  if (nrow(max_rows) > 1 && length(unique(max_rows$gene)) == 1)
+    return(data.frame(gene = max_rows$gene[1], value = max_val, stringsAsFactors = FALSE))
+  if (length(vals) > 1 && max_val >= sum(vals[2:length(vals)]) * 3)
+    return(data.frame(gene = max_rows$gene[1], value = max_val, stringsAsFactors = FALSE))
+  NULL
+}
+selectGuideSgRNA <- function(data, barcode) {      # sgRNA-level assignment
+  data <- as.data.frame(data); if (nrow(data) == 0) return(NULL)
+  vals <- sort(data$value, decreasing = TRUE)
+  if (all(vals == 0)) return(data.frame(sgrna = data$sgrna, value = data$value, stringsAsFactors = FALSE))
+  max_val <- vals[1]; max_rows <- data[data$value >= max_val, ]
+  if (nrow(max_rows) > 1 && length(unique(max_rows$sgrna)) == 1)
+    return(data.frame(sgrna = max_rows$sgrna[1], value = max_val, stringsAsFactors = FALSE))
+  if (length(vals) > 1 && max_val >= sum(vals[2:length(vals)]) * 3)
+    return(data.frame(sgrna = max_rows$sgrna[1], value = max_val, stringsAsFactors = FALSE))
+  NULL
+}
+
+d1 <- fread(file.path(BASE, "multi/batch1/sgrna_stats_sgrna.csv.gz"))
+d2 <- fread(file.path(BASE, "multi/batch2/sgrna_stats_sgrna.csv.gz"))
+d1$barcode <- paste0(d1$barcode, "-1_1"); d2$barcode <- paste0(d2$barcode, "-1_2")
+df_all <- rbind(d1, d2)
+df_all <- df_all[df_all$barcode %in% rownames(obj@meta.data), ]
+
+dcast_assign <- function(fun, key) {
+  r <- df_all %>% group_by(barcode) %>% group_modify(~ {
+    v <- fun(.x, .y$barcode)
+    if (is.null(v)) {                      # empty result must keep the same column names
+      d <- data.frame(character(0), numeric(0)); names(d) <- c(key, "value"); d
+    } else v
+  }) %>% ungroup() %>% as.data.frame()
+  # group_modify output already contains barcode + key + value
+  # reformulate(termlabels, response): here response = barcode, termlabels = key
+  r <- reshape2::dcast(r[r[[key]] != ""], reformulate("barcode", key),
+                       value.var = "value", fun.aggregate = mean, fill = 0)
+  rownames(r) <- r[[key]]; r <- r[, colnames(r) != key]
+  r[, intersect(colnames(r), rownames(obj@meta.data))]
+}
+df_result   <- dcast_assign(selectGuide, "gene")       # genes x cells
+df_result_s <- dcast_assign(selectGuideSgRNA, "sgrna")  # guides x cells
+```
+
+## 8. Per-cell-type sgRNA counts
+
+```{r stats-fn}
+calculate_sgrna_stats <- function(df_result, colmap) {
+  temp <- reshape2::melt(as.matrix(df_result))
+  temp <- temp[temp$value > 0, ]
+  temp$cells <- colmap[as.character(temp$Var2)]        # map by name, not by factor position
+  temp1 <- as.data.frame(table(unique(temp[temp$Var1 != "STC", c("cells", "Var2")])$cells))
+  temp <- temp %>% group_by(Var1, cells) %>% add_tally() %>%
+    dplyr::select(Var1, cells, n) %>% unique() %>%
+    reshape2::dcast(cells ~ Var1, value.var = "n", fun.aggregate = sum, fill = 0) %>% as.data.frame()
+  temp <- merge(temp, temp1, by.x = "cells", by.y = "Var1", all.x = TRUE)  # keep cell types with STC only
+  temp$Freq[is.na(temp$Freq)] <- 0
+  rownames(temp) <- temp$cells
+  temp[, colnames(temp) != "cells"]
+}
+c_map <- setNames(as.character(obj$cells), colnames(obj))
+
+temp_c <- calculate_sgrna_stats(df_result, c_map)
+fwrite(as.data.frame(temp_c) %>% tibble::rownames_to_column("cells"),
+       file.path(RES_DIR, "sgrna_stats_by_celltype.csv"))
+```
+
+## 9. Enrichment testing (Fisher exact test + BH)
+
+For each (gene, cell type) pair a 2x2 contingency table is built against the STC
+(non-targeting) control and tested with a Fisher exact test; p-values are corrected
+within each cell type using the Benjamini-Hochberg method.
+
+```{r fisher-bh}
+fisher_all <- function(temp, padj_method) {
+  res <- lapply(rownames(temp), function(cell) {
+    lapply(colnames(temp)[!colnames(temp) %in% c("STC", "Freq", "Total")], function(gene) {
+      a <- temp[cell, gene]; b <- sum(temp[, gene])
+      c <- temp[cell, "STC"]; d <- sum(temp[, "STC"])
+      p <- fisher.test(matrix(c(a, b - a, c, d - c), nrow = 2, byrow = TRUE))
+      data.frame(gene = gene, cell = cell, p_val = p$p.value, odd_ratio = p$estimate,
+                 pos_in_targets = a, pos_total = b, ctrl_in_targets = c, ctrl_total = d)
+    }) %>% do.call(rbind, .)
+  })
+  res <- do.call(rbind, res); rownames(res) <- NULL
+  res$log2od <- log2(res$odd_ratio); res[!is.finite(res$log2od), "log2od"] <- NA
+  res %>% group_by(cell) %>% mutate(padj = p.adjust(p_val, method = padj_method)) %>% as.data.frame()
+}
+r_c <- fisher_all(temp_c, "BH")
+fwrite(r_c, file.path(RES_DIR, "fisher_enrichment_results.csv"))
+```
+
+## 10. log2(OR) enrichment dot plot
+
+```{r dotplots}
+tfs <- list(
+  Novel = c("ZNF875","ZNF706","ZNF555","ZNF512","ZNF431","ZNF385D","ZNF207",
+            "ZBTB8A","ZBTB16","THYN1","TFDP2","TCF7L2","STAT5","SMYD3",
+            "SCMH1","SALL4","POU2AF1","PA2G4","NR3C1","NME2","MLXIP",
+            "MEF2A","MAFF","IRF5","HOXA6","HMGN3","HMGA1","GTF3A",
+            "ELK3","ELK1","E2F2","DRAP1","CSRNP1","CHCHD3","AHDC1"),
+  Known = c("RIOK2","RUNX3","KLF1","GATA1","GATA2","TAL1","LEF1","CEBPE","SPI1","HOXA7"))
+order_ct <- c("LMPP","Gran","Mono","EBMP","MEP","EryP","ProEry","Ery")  # developmental order
+
+build_resp <- function(res) {
+  r <- res[res$gene %in% unlist(tfs) & !is.na(res$padj) & res$pos_in_targets > 0, ]
+  r <- data.frame(gene = r$gene, cell = r$cell, padj = r$padj,
+                  a = r$pos_in_targets, log2od = r$log2od)
+  keep <- intersect(order_ct, unique(r$cell))       # keep the developmental lineages only
+  r <- r[r$cell %in% keep, ]
+  r$sig.perc <- r$a / ave(r$a, r$cell, FUN = sum)
+  r$group <- ifelse(r$gene %in% tfs$Novel, "Novel", "Known")
+  r$gene <- factor(r$gene, levels = rev(unique(as.character(unlist(tfs)))))
+  r$cell <- factor(r$cell, levels = rev(keep))
+  r
+}
+base_plot <- function(resp) {
+  ggscatter(resp, x = "gene", y = "cell", color = "log2od", size = "sig.perc") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5)) +
+    scale_color_gradientn(name = "log2(OR)",
+                          colours = c("#3300cc","#4157A4","white","#FF3333","#CC0000"),
+                          limits = c(-2, 2), oob = scales::squish, na.value = "lightgrey") +
+    scale_size_continuous(limits = c(0, 1), range = c(0.5, 14)) +
+    facet_grid(. ~ group, scales = "free_x", space = "free") + labs(x = "", y = "")
+}
+ggsave(file.path(RES_DIR, "enrichment_dotplot.pdf"), base_plot(build_resp(r_c)),
+       width = 16, height = 5.5)
+```
+
+## 11. STC guide correlation (corrgram) and cell-proportion bar plot
+
+```{r corr-barplot}
+temp <- reshape2::melt(as.matrix(df_result_s))
+temp$cell <- c_map[temp$Var2]
+temp <- temp[temp$value != 0 & str_detect(temp$Var1, "STC"), ]
+temp <- temp %>% group_by(cell, Var1) %>% add_tally() %>%
+  dplyr::select(cell, Var1, n) %>% unique() %>%
+  group_by(Var1) %>% mutate(p = n / sum(n) * 100) %>% as.data.frame()
+temp <- lapply(unique(temp$cell), function(x) {      # fill in missing cell type x guide combinations
+  stcs <- unique(temp$Var1); tsub <- temp[temp$cell == x, ]
+  stcs <- stcs[!stcs %in% tsub$Var1]
+  if (length(stcs) > 0) tsub <- rbind(tsub, data.frame(cell = x, Var1 = stcs, n = 0, p = 0))
+  tsub
+}); temp <- do.call(rbind, temp)
+
+tt <- temp
+tt$Var1 <- factor(as.character(tt$Var1), levels = paste0("STC_", 1:15))
+tt$cell <- factor(tt$cell, levels = levels(factor(obj$cells)))
+ggsave(file.path(RES_DIR, "sgrna_props_barplot.pdf"),
+       ggbarplot(tt, x = "cell", y = "p", fill = "Var1", color = NA,
+                 position = position_dodge2(), ggtheme = theme_pubr(legend = "right")) +
+         labs(fill = "", x = "", y = "Cell proportion (%)") +
+         scale_fill_brewer(palette = "Paired"), width = 10, height = 4)
+
+mcor <- reshape2::dcast(temp, Var1 ~ cell, value.var = "p", fill = 0, fun.aggregate = mean)
+rownames(mcor) <- mcor$Var1; mcor <- mcor[, colnames(mcor) != "Var1"]
+mcor <- mcor[order(as.integer(sub("STC_", "", rownames(mcor)))), ]   # numeric order STC_2..15
+
+# Custom palette aimed at the high-correlation range 0.95-1.0
+custom_palette_high_cor <- function(n = 200) {
+  cf <- colorRamp(c("#ffffcc","#ffeda0","#fed976","#feb24c","#fd8d3c","#f03b20"), space = "rgb")
+  t <- seq(0, 1, length.out = n); rgb(cf(t)[, 1]/255, cf(t)[, 2]/255, cf(t)[, 3]/255)
+}
+my_colors <- custom_palette_high_cor(200)
+panel.shade.with.cor <- function(x, y, ...) {
+  v <- cor(x, y, use = "complete.obs"); usr <- par("usr")
+  ci <- if (v >= 0.95) max(1, min(200, round((v - 0.95) / 0.05 * 199) + 1)) else 1
+  rect(usr[1], usr[3], usr[2], usr[4], col = my_colors[ci], border = "gray80", lwd = 0.5)
+  text(mean(usr[1:2]), mean(usr[3:4]), sprintf("%.3f", v), cex = 1.2,
+       col = ifelse(v > 0.98, "white", "black"), font = 2)
+}
+nv <- nrow(mcor); pc <- 0
+panel.pts.ticks <- function(x, y, ...) {
+  panel.pts(x, y, ...); pc <<- pc + 1; ri <- 1; tot <- 0
+  while (pc > tot + (ri - 1)) { tot <- tot + (ri - 1); ri <- ri + 1 }
+  if (pc - tot == 1) axis(2, at = pretty(range(y), n = 3), cex.axis = 0.7, col = "gray50", las = 1)
+  if (ri == nv) axis(1, at = pretty(range(x), n = 3), cex.axis = 0.7, col = "gray50")
+}
+vn <- rownames(mcor)
+pdf(file.path(RES_DIR, "sgrna_stc_corr.pdf"), width = 10, height = 10)
+corrgram(t(mcor), main = "", lower.panel = panel.pts.ticks, upper.panel = panel.shade.with.cor,
+         diag.panel = panel.density, order = FALSE, labels = NULL,
+         outer.labels = list(top = list(labels = vn, cex = 1.2, srt = 0, adj = c(.5, -.5)),
+                             right = list(labels = vn, cex = 1.2, srt = 0, adj = c(0, 0))))
+dev.off()
+```
+
+## 12. sgRNA composition pie chart and per-sgRNA cell count bar plot
+
+```{r pie-barcount}
+tmp <- reshape2::melt(as.matrix(df_result))
+tmp$cell <- c_map[as.character(tmp$Var2)]
+tmp <- tmp[tmp$value != 0, ]
+pie <- data.frame(group = c("STC", "TF-targeting sgRNAs", "Not detected"),
+                  value = c(sum(tmp$Var1 == "STC"), sum(tmp$Var1 != "STC"),
+                            ncol(obj) - nrow(tmp)))
+pie$freq <- sprintf("%.2f%%", pie$value / sum(pie$value) * 100)
+write.csv(pie, file.path(RES_DIR, "sgrna_props_summary.csv"), row.names = FALSE)
+ggsave(file.path(RES_DIR, "sgrna_props_pie.pdf"),
+       ggpie(pie, "value", label = "freq", fill = "group", color = "white",
+             palette = c("lightgrey", "#f08e7e", "#2572a9"), lab.pos = "in",
+             lab.font = "black") + labs(fill = ""), width = 4, height = 5)
+
+bc <- reshape2::melt(as.matrix(df_result))
+bc$cell <- c_map[as.character(bc$Var2)]
+bc <- bc[bc$value != 0 & bc$Var1 != "STC", ]
+bc <- bc %>% group_by(Var1) %>% add_tally() %>% dplyr::select(Var1, n) %>% unique() %>% as.data.frame()
+ggsave(file.path(RES_DIR, "sgrna_number_of_cells_barplot.pdf"),
+       ggbarplot(bc, x = "Var1", y = "n", fill = "#598BB8", color = NA) +
+         theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5),
+               panel.border = element_rect(color = "black", fill = NA, linewidth = 1)) +
+         labs(y = "Number of cells", x = "") + geom_hline(yintercept = 100, linetype = "dashed"),
+       width = 10, height = 5)
+```
+
+## 13. sgRNA UMAP 2D density (one panel per sgRNA + STC overview)
+
+```{r hex}
+# The STC_t assay stores raw counts in the object; normalise before plotting
+objh <- readRDS(file.path(BASE, "multi/seurat_clean.rds"))
+DefaultAssay(objh) <- "STC_t"; objh <- NormalizeData(objh); objh <- ScaleData(objh)
+genes <- setdiff(rownames(objh@assays$STC_t@data), "STC")
+genes <- genes[!genes %in% c("HLX", "MLXIP", "NFE2", "PCGF6")]
+plist <- lapply(c("STC", genes), function(i) {
+  u <- as.data.frame(objh@reductions$umap@cell.embeddings)
+  u$value <- objh@assays$STC_t@data[i, rownames(u)]
+  pal <- c("lightgrey", "yellow", "red")
+  if (i == "STC") pal <- c("#D5E5F2FF", "#A9D2DC", "#4575b4")
+  u <- u[order(u$value, decreasing = TRUE), ]
+  p <- ggplot(u, aes(umap_1, umap_2, z = value)) +
+    stat_summary_hex(bins = c(30, 30), fun = "mean", na.rm = TRUE) +
+    labs(title = i) + theme_pubr()
+  if (i == "STC") p + scale_fill_gradientn(name = "Cell count", colors = pal,
+      limits = c(0, 1), values = scales::rescale(c(0, .2, 1)), oob = scales::squish,
+      na.value = "lightgrey")
+  else p + scale_fill_gradientn(name = "Cell count", colors = pal,
+      values = scales::rescale(c(0, .2, 1)), limits = c(0, 1), oob = scales::squish,
+      na.value = "lightgrey")
+})
+pdf(file.path(RES_DIR, "sgrna_feature_raster_per_sgrna.pdf"), width = 28, height = 35)
+cowplot::plot_grid(plotlist = plist, nrow = 7); dev.off()
+ggsave(file.path(RES_DIR, "sgrna_feature_STC.pdf"), plist[[1]], width = 4, height = 5)
+```
+
+Note that the `echo = FALSE` parameter can be added to a code chunk to prevent printing of
+the R code that generated a plot.
